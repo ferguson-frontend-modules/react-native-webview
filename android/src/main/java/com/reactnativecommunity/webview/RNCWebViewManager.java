@@ -81,6 +81,7 @@ import com.reactnativecommunity.webview.events.TopLoadingStartEvent;
 import com.reactnativecommunity.webview.events.TopMessageEvent;
 import com.reactnativecommunity.webview.events.TopShouldStartLoadWithRequestEvent;
 import com.reactnativecommunity.webview.events.TopRenderProcessGoneEvent;
+import com.reactnativecommunity.webview.events.FGTopShouldStartLoadWithRequestEvent;
 
 import org.json.JSONException;
 import org.json.JSONObject;
@@ -606,7 +607,7 @@ public class RNCWebViewManager extends SimpleViewManager<WebView> {
       export = MapBuilder.newHashMap();
     }
     export.put(TopLoadingProgressEvent.EVENT_NAME, MapBuilder.of("registrationName", "onLoadingProgress"));
-    export.put(TopShouldStartLoadWithRequestEvent.EVENT_NAME, MapBuilder.of("registrationName", "onShouldStartLoadWithRequest"));
+    export.put(FGTopShouldStartLoadWithRequestEvent.EVENT_NAME, MapBuilder.of("registrationName", "onShouldStartLoadWithRequest"));
     export.put(ScrollEventType.getJSEventName(ScrollEventType.SCROLL), MapBuilder.of("registrationName", "onScroll"));
     export.put(TopHttpErrorEvent.EVENT_NAME, MapBuilder.of("registrationName", "onHttpError"));
     export.put(TopRenderProcessGoneEvent.EVENT_NAME, MapBuilder.of("registrationName", "onRenderProcessGone"));
@@ -833,6 +834,7 @@ public class RNCWebViewManager extends SimpleViewManager<WebView> {
       super.onPageStarted(webView, url, favicon);
       mLastLoadFailed = false;
 
+      Log.d("Override onPageStarted", url);
       RNCWebView reactWebView = (RNCWebView) webView;
       reactWebView.callInjectedJavaScriptBeforeContentLoaded();
 
@@ -883,6 +885,7 @@ public class RNCWebViewManager extends SimpleViewManager<WebView> {
       } else {
         FLog.w(TAG, "Couldn't use blocking synchronous call for onShouldStartLoadWithRequest due to debugging or missing Catalyst instance, falling back to old event-and-load.");
         progressChangedFilter.setWaitingForCommandLoadUrl(true);
+        
         ((RNCWebView) view).dispatchEvent(
           view,
           new TopShouldStartLoadWithRequestEvent(
@@ -892,11 +895,66 @@ public class RNCWebViewManager extends SimpleViewManager<WebView> {
       }
     }
 
+    public boolean shouldOverrideUrlLoading(WebView view, String url, Boolean isRedirect) {
+      final RNCWebView rncWebView = (RNCWebView) view;
+      final boolean isJsDebugging = ((ReactContext) view.getContext()).getJavaScriptContextHolder().get() == 0;
+
+      if (!isJsDebugging && rncWebView.mCatalystInstance != null) {
+        final Pair<Integer, AtomicReference<ShouldOverrideCallbackState>> lock = RNCWebViewModule.shouldOverrideUrlLoadingLock.getNewLock();
+        final int lockIdentifier = lock.first;
+        final AtomicReference<ShouldOverrideCallbackState> lockObject = lock.second;
+
+        final WritableMap event = createWebViewEvent(view, url);
+        event.putInt("lockIdentifier", lockIdentifier);
+        if(isRedirect) {
+          event.putString("navigationType", "other");
+        }else {
+          event.putString("navigationType", "click");
+        }
+        rncWebView.sendDirectMessage("onShouldStartLoadWithRequest", event);
+
+        try {
+          assert lockObject != null;
+          synchronized (lockObject) {
+            final long startTime = SystemClock.elapsedRealtime();
+            while (lockObject.get() == ShouldOverrideCallbackState.UNDECIDED) {
+              if (SystemClock.elapsedRealtime() - startTime > SHOULD_OVERRIDE_URL_LOADING_TIMEOUT) {
+                FLog.w(TAG, "Did not receive response to shouldOverrideUrlLoading in time, defaulting to allow loading.");
+                RNCWebViewModule.shouldOverrideUrlLoadingLock.removeLock(lockIdentifier);
+                return false;
+              }
+              lockObject.wait(SHOULD_OVERRIDE_URL_LOADING_TIMEOUT);
+            }
+          }
+        } catch (InterruptedException e) {
+          FLog.e(TAG, "shouldOverrideUrlLoading was interrupted while waiting for result.", e);
+          RNCWebViewModule.shouldOverrideUrlLoadingLock.removeLock(lockIdentifier);
+          return false;
+        }
+
+        final boolean shouldOverride = lockObject.get() == ShouldOverrideCallbackState.SHOULD_OVERRIDE;
+        RNCWebViewModule.shouldOverrideUrlLoadingLock.removeLock(lockIdentifier);
+
+        return shouldOverride;
+      } else {
+        FLog.w(TAG, "Couldn't use blocking synchronous call for onShouldStartLoadWithRequest due to debugging or missing Catalyst instance, falling back to old event-and-load.");
+        progressChangedFilter.setWaitingForCommandLoadUrl(true);
+        
+        ((RNCWebView) view).dispatchEvent(
+          view,
+          new FGTopShouldStartLoadWithRequestEvent(
+            view.getId(),
+            createWebViewEvent(view, url),
+            isRedirect));
+        return true;
+      }
+    }
+
     @TargetApi(Build.VERSION_CODES.N)
     @Override
     public boolean shouldOverrideUrlLoading(WebView view, WebResourceRequest request) {
       final String url = request.getUrl().toString();
-      return this.shouldOverrideUrlLoading(view, url);
+      return this.shouldOverrideUrlLoading(view, url, request.isRedirect());
     }
 
     @Override
